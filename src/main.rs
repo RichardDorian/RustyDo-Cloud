@@ -1,8 +1,13 @@
 use std::net::SocketAddr;
 
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    http::StatusCode,
+    routing::{get, post},
+};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
 // Models
@@ -17,11 +22,23 @@ struct Todo {
     created_at: DateTime<Utc>,
 }
 
+#[derive(Deserialize)]
+struct CreateTodoBody {
+    title: Option<String>,
+    description: Option<String>,
+    due_date: Option<String>,
+}
+
 // App state
 
 #[derive(Clone)]
 struct AppState {
     database: PgPool,
+}
+
+#[derive(Deserialize)]
+struct TodosQuery {
+    status: Option<String>,
 }
 
 #[tokio::main]
@@ -61,8 +78,8 @@ async fn main() {
     let state = AppState { database: pool };
 
     let app = Router::new()
-        .route("/", get(root))
         .route("/todos", get(todos))
+        .route("/todos", post(create_todo))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -70,17 +87,53 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn root() -> &'static str {
-    "Hello, World!"
-}
-
-async fn todos(State(state): State<AppState>) -> (StatusCode, Json<Vec<Todo>>) {
-    let res = sqlx::query_as::<_, Todo>("SELECT * FROM todos ORDER BY created_at DESC")
-        .fetch_all(&state.database)
-        .await;
+async fn todos(
+    State(state): State<AppState>,
+    Query(query): Query<TodosQuery>,
+) -> (StatusCode, Json<Vec<Todo>>) {
+    let res = match query.status.as_deref() {
+        Some("pending") | Some("done") => {
+            sqlx::query_as::<_, Todo>(
+                "SELECT * FROM todos WHERE status = $1 ORDER BY created_at DESC",
+            )
+            .bind(query.status.as_deref().unwrap_or_default())
+            .fetch_all(&state.database)
+            .await
+        }
+        Some(_) => return (StatusCode::BAD_REQUEST, vec![].into()),
+        None => {
+            sqlx::query_as::<_, Todo>("SELECT * FROM todos ORDER BY created_at DESC")
+                .fetch_all(&state.database)
+                .await
+        }
+    };
 
     match res {
         Ok(todos) => (StatusCode::OK, todos.into()),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, vec![].into()),
+    }
+}
+
+async fn create_todo(
+    State(state): State<AppState>,
+    Json(body): Json<CreateTodoBody>,
+) -> StatusCode {
+    let title = body.title.unwrap_or_default().trim().to_string();
+    if title.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    let res = sqlx::query_as::<_, Todo>(
+        "INSERT INTO todos(title, description, due_date) VALUES ($1, $2, $3) RETURNING id, title, description, due_date, status, created_at",
+    )
+    .bind(title)
+    .bind(body.description)
+    .bind(body.due_date)
+    .fetch_one(&state.database)
+    .await;
+
+    match res {
+        Ok(_) => StatusCode::CREATED,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
