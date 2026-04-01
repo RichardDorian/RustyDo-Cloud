@@ -88,6 +88,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/todos", get(todos))
+        .route("/todos/overdue", get(overdue_todos))
         .route("/todos", post(create_todo))
         .route("/todos/{id}", patch(update_todo))
         .route("/todos/{id}", delete(delete_todo))
@@ -149,6 +150,19 @@ async fn create_todo(
             println!("{err}");
             StatusCode::INTERNAL_SERVER_ERROR
         }
+    }
+}
+
+async fn overdue_todos(State(state): State<AppState>) -> (StatusCode, Json<Vec<Todo>>) {
+    let res = sqlx::query_as::<_, Todo>(
+        "SELECT * FROM todos WHERE due_date <= CURRENT_DATE AND status = 'pending' ORDER BY due_date ASC, created_at DESC",
+    )
+    .fetch_all(&state.database)
+    .await;
+
+    match res {
+        Ok(todos) => (StatusCode::OK, todos.into()),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, vec![].into()),
     }
 }
 
