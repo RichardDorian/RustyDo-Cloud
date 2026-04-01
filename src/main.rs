@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -90,6 +90,7 @@ async fn main() {
         .route("/todos", get(todos))
         .route("/todos", post(create_todo))
         .route("/todos/{id}", patch(update_todo))
+        .route("/todos/{id}", delete(delete_todo))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -213,5 +214,18 @@ async fn update_todo(
             println!("{err}");
             StatusCode::INTERNAL_SERVER_ERROR
         }
+    }
+}
+
+async fn delete_todo(State(state): State<AppState>, Path(id): Path<i32>) -> StatusCode {
+    let res = sqlx::query("DELETE FROM todos WHERE id = $1")
+        .bind(id)
+        .execute(&state.database)
+        .await;
+
+    match res {
+        Ok(res) if res.rows_affected() == 0 => StatusCode::NOT_FOUND,
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
