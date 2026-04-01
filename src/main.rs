@@ -1,14 +1,19 @@
 use std::net::SocketAddr;
+use std::{convert::Infallible, time::Duration};
 
+use axum::response::Response;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
+    http::header::{CACHE_CONTROL, CONNECTION, CONTENT_TYPE},
+    response::{IntoResponse, Sse, sse::Event},
     routing::{delete, get, patch, post},
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
+use tokio::sync::broadcast;
 
 // Models
 
@@ -20,6 +25,14 @@ struct Todo {
     due_date: Option<NaiveDate>,
     status: String,
     created_at: DateTime<Utc>,
+}
+
+#[derive(Serialize, Clone)]
+struct TodoAlert {
+    id: i32,
+    title: String,
+    status: String,
+    due_date: Option<NaiveDate>,
 }
 
 #[derive(Deserialize)]
@@ -38,11 +51,10 @@ struct UpdateTodoBody {
     status: Option<String>,
 }
 
-// App state
-
-#[derive(Clone)]
-struct AppState {
-    database: PgPool,
+#[derive(Serialize)]
+struct NotifyResponse {
+    message: &'static str,
+    listeners: usize,
 }
 
 #[derive(Deserialize)]
@@ -50,54 +62,16 @@ struct TodosQuery {
     status: Option<String>,
 }
 
-#[tokio::main]
-async fn main() {
-    dotenvy::dotenv().ok();
+// App state
 
-    let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "3000".to_string())
-        .parse()
-        .unwrap_or(3000);
-    let database_url = std::env::var("POSTGRESQL_ADDON_URI").expect("Database URL not defined.");
-
-    println!("{database_url}");
-
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
-        .await
-        .expect("Unable to connect to database.");
-
-    println!("Connected to database!");
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS todos (
-                id SERIAL PRIMARY KEY,
-                title VARCHAR NOT NULL,
-                description VARCHAR,
-                due_date DATE,
-                status VARCHAR CHECK (status IN ('pending', 'done')) DEFAULT 'pending',
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            )",
-    )
-    .execute(&pool)
-    .await
-    .expect("Cannot initialize database");
-
-    let state = AppState { database: pool };
-
-    let app = Router::new()
-        .route("/todos", get(todos))
-        .route("/todos/overdue", get(overdue_todos))
-        .route("/todos", post(create_todo))
-        .route("/todos/{id}", patch(update_todo))
-        .route("/todos/{id}", delete(delete_todo))
-        .with_state(state);
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+#[derive(Clone)]
+struct AppState {
+    database: PgPool,
+    alert_tx: broadcast::Sender<TodoAlert>,
+    app_name: String,
 }
+
+// Routes
 
 async fn todos(
     State(state): State<AppState>,
@@ -164,6 +138,47 @@ async fn overdue_todos(State(state): State<AppState>) -> (StatusCode, Json<Vec<T
         Ok(todos) => (StatusCode::OK, todos.into()),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, vec![].into()),
     }
+}
+
+async fn alerts(State(state): State<AppState>) -> impl IntoResponse {
+    let mut rx = state.alert_tx.subscribe();
+    let stream = async_stream::stream! {
+        let mut ping = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                recv_result = rx.recv() => {
+                    match recv_result {
+                        Ok(alert) => {
+                            match Event::default().event("todo_alert").json_data(alert) {
+                                Ok(event) => yield Ok::<Event, Infallible>(event),
+                                Err(_) => break,
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+                _ = ping.tick() => {
+                    yield Ok::<Event, Infallible>(Event::default().event("ping").data("{}"));
+                }
+            }
+        }
+    };
+
+    let mut response = Sse::new(stream).into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        "text/event-stream".parse().expect("valid content type"),
+    );
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        "no-cache".parse().expect("valid cache control"),
+    );
+    response.headers_mut().insert(
+        CONNECTION,
+        "keep-alive".parse().expect("valid connection header"),
+    );
+    response
 }
 
 async fn update_todo(
@@ -242,4 +257,132 @@ async fn delete_todo(State(state): State<AppState>, Path(id): Path<i32>) -> Stat
         Ok(_) => StatusCode::NO_CONTENT,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+async fn notify_todo(
+    State(state): State<AppState>,
+    Path(id): Path<i32>,
+) -> (StatusCode, Json<NotifyResponse>) {
+    let todo = sqlx::query_as::<_, Todo>(
+        "SELECT id, title, description, due_date, status, created_at FROM todos WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.database)
+    .await;
+
+    let todo = match todo {
+        Ok(Some(todo)) => todo,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(NotifyResponse {
+                    message: "Todo introuvable",
+                    listeners: 0,
+                }),
+            );
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(NotifyResponse {
+                    message: "Erreur serveur",
+                    listeners: 0,
+                }),
+            );
+        }
+    };
+
+    let listeners = state
+        .alert_tx
+        .send(TodoAlert {
+            id: todo.id,
+            title: todo.title,
+            status: todo.status,
+            due_date: todo.due_date,
+        })
+        .unwrap_or(0);
+
+    (
+        StatusCode::OK,
+        Json(NotifyResponse {
+            message: "Alerte envoyée",
+            listeners,
+        }),
+    )
+}
+
+async fn health(State(state): State<AppState>) -> Response {
+    let res = sqlx::query("SELECT 1;").execute(&state.database).await;
+
+    match res {
+        Ok(_) => Json(serde_json::json!({
+            "status": "ok",
+            "app": state.app_name,
+            "database": "connected"
+        })),
+        Err(_) => Json(serde_json::json!({
+            "status": "error",
+            "app": state.app_name,
+            "database": "unreachable"
+        })),
+    }
+    .into_response()
+}
+
+#[tokio::main]
+async fn main() {
+    dotenvy::dotenv().ok();
+
+    let port: u16 = std::env::var("PORT")
+        .unwrap_or_else(|_| "3000".to_string())
+        .parse()
+        .unwrap_or(3000);
+    let app_name = std::env::var("APP_NAME").unwrap_or_else(|_| "my-app".to_string());
+    let database_url = std::env::var("POSTGRESQL_ADDON_URI").expect("Database URL not defined.");
+
+    println!("{database_url}");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .expect("Unable to connect to database.");
+
+    println!("Connected to database!");
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS todos (
+                id SERIAL PRIMARY KEY,
+                title VARCHAR NOT NULL,
+                description VARCHAR,
+                due_date DATE,
+                status VARCHAR CHECK (status IN ('pending', 'done')) DEFAULT 'pending',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )",
+    )
+    .execute(&pool)
+    .await
+    .expect("Cannot initialize database");
+
+    let (alert_tx, _) = broadcast::channel(100);
+    let state = AppState {
+        database: pool,
+        alert_tx,
+        app_name,
+    };
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/alerts", get(alerts))
+        .route("/todos", get(todos))
+        .route("/todos/overdue", get(overdue_todos))
+        .route("/todos", post(create_todo))
+        .route("/todos/{id}/notify", post(notify_todo))
+        .route("/todos/{id}", patch(update_todo))
+        .route("/todos/{id}", delete(delete_todo))
+        .with_state(state);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
