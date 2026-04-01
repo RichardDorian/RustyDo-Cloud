@@ -6,7 +6,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
@@ -17,7 +17,7 @@ struct Todo {
     id: i32,
     title: String,
     description: Option<String>,
-    due_date: Option<DateTime<Utc>>,
+    due_date: Option<NaiveDate>,
     status: String,
     created_at: DateTime<Utc>,
 }
@@ -26,7 +26,7 @@ struct Todo {
 struct CreateTodoBody {
     title: Option<String>,
     description: Option<String>,
-    due_date: Option<String>,
+    due_date: Option<NaiveDate>, // NaiveDate == Postgres' Date
 }
 
 // App state
@@ -67,7 +67,7 @@ async fn main() {
                 title VARCHAR NOT NULL,
                 description VARCHAR,
                 due_date DATE,
-                status VARCHAR CHECK (status IN ('pending', 'done')),
+                status VARCHAR CHECK (status IN ('pending', 'done')) DEFAULT 'pending',
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )",
     )
@@ -134,6 +134,9 @@ async fn create_todo(
 
     match res {
         Ok(_) => StatusCode::CREATED,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(err) => {
+            println!("{err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     }
 }
