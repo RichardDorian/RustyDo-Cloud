@@ -12,7 +12,7 @@ use axum::{
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{PgPool, postgres::{PgListener, PgPoolOptions}};
 use tokio::sync::broadcast;
 
 // Models
@@ -27,7 +27,7 @@ struct Todo {
     created_at: DateTime<Utc>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 struct TodoAlert {
     id: i32,
     title: String,
@@ -292,15 +292,42 @@ async fn notify_todo(
         }
     };
 
-    let listeners = state
-        .alert_tx
-        .send(TodoAlert {
-            id: todo.id,
-            title: todo.title,
-            status: todo.status,
-            due_date: todo.due_date,
-        })
-        .unwrap_or(0);
+    let alert = TodoAlert {
+        id: todo.id,
+        title: todo.title,
+        status: todo.status,
+        due_date: todo.due_date,
+    };
+
+    let payload = match serde_json::to_string(&alert) {
+        Ok(payload) => payload,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(NotifyResponse {
+                    message: "Erreur serveur",
+                    listeners: 0,
+                }),
+            );
+        }
+    };
+
+    let publish = sqlx::query("SELECT pg_notify('todo_alerts', $1)")
+        .bind(payload)
+        .execute(&state.database)
+        .await;
+
+    if publish.is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(NotifyResponse {
+                message: "Erreur serveur",
+                listeners: 0,
+            }),
+        );
+    }
+
+    let listeners = state.alert_tx.receiver_count();
 
     (
         StatusCode::OK,
@@ -309,6 +336,46 @@ async fn notify_todo(
             listeners,
         }),
     )
+}
+
+fn spawn_pg_alert_listener(database_url: String, alert_tx: broadcast::Sender<TodoAlert>) {
+    tokio::spawn(async move {
+        loop {
+            match PgListener::connect(&database_url).await {
+                Ok(mut listener) => {
+                    if let Err(err) = listener.listen("todo_alerts").await {
+                        eprintln!("pg listen failed: {err}");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+
+                    loop {
+                        match listener.recv().await {
+                            Ok(notification) => {
+                                match serde_json::from_str::<TodoAlert>(notification.payload()) {
+                                    Ok(alert) => {
+                                        let _ = alert_tx.send(alert);
+                                    }
+                                    Err(err) => {
+                                        eprintln!("invalid todo_alert payload: {err}");
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("pg listener disconnected: {err}");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("pg listener connect failed: {err}");
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
 }
 
 async fn health(State(state): State<AppState>) -> Response {
@@ -365,6 +432,7 @@ async fn main() {
     .expect("Cannot initialize database");
 
     let (alert_tx, _) = broadcast::channel(100);
+    spawn_pg_alert_listener(database_url.clone(), alert_tx.clone());
     let state = AppState {
         database: pool,
         alert_tx,
