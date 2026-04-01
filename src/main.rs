@@ -2,9 +2,9 @@ use std::net::SocketAddr;
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,15 @@ struct CreateTodoBody {
     title: Option<String>,
     description: Option<String>,
     due_date: Option<NaiveDate>, // NaiveDate == Postgres' Date
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateTodoBody {
+    title: Option<String>,
+    description: Option<Option<String>>,
+    due_date: Option<Option<NaiveDate>>,
+    status: Option<String>,
 }
 
 // App state
@@ -80,6 +89,7 @@ async fn main() {
     let app = Router::new()
         .route("/todos", get(todos))
         .route("/todos", post(create_todo))
+        .route("/todos/{id}", patch(update_todo))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -134,6 +144,71 @@ async fn create_todo(
 
     match res {
         Ok(_) => StatusCode::CREATED,
+        Err(err) => {
+            println!("{err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn update_todo(
+    State(state): State<AppState>,
+    Path(id): Path<i32>,
+    Json(body): Json<UpdateTodoBody>,
+) -> StatusCode {
+    let title_set = body.title.is_some();
+    let description_set = body.description.is_some();
+    let due_date_set = body.due_date.is_some();
+    let status_set = body.status.is_some();
+
+    if !title_set && !description_set && !due_date_set && !status_set {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    let title = match body.title {
+        Some(title) => {
+            let trimmed = title.trim().to_string();
+            if trimmed.is_empty() {
+                return StatusCode::BAD_REQUEST;
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+
+    let status = match body.status {
+        Some(status) => {
+            if status != "pending" && status != "done" {
+                return StatusCode::BAD_REQUEST;
+            }
+            Some(status)
+        }
+        None => None,
+    };
+
+    let res = sqlx::query(
+        "UPDATE todos
+         SET title = CASE WHEN $1 THEN $2 ELSE title END,
+             description = CASE WHEN $3 THEN $4 ELSE description END,
+             due_date = CASE WHEN $5 THEN $6 ELSE due_date END,
+             status = CASE WHEN $7 THEN $8 ELSE status END
+         WHERE id = $9",
+    )
+    .bind(title_set)
+    .bind(title)
+    .bind(description_set)
+    .bind(body.description.unwrap_or(None))
+    .bind(due_date_set)
+    .bind(body.due_date.unwrap_or(None))
+    .bind(status_set)
+    .bind(status)
+    .bind(id)
+    .execute(&state.database)
+    .await;
+
+    match res {
+        Ok(res) if res.rows_affected() == 0 => StatusCode::NOT_FOUND,
+        Ok(_) => StatusCode::OK,
         Err(err) => {
             println!("{err}");
             StatusCode::INTERNAL_SERVER_ERROR
