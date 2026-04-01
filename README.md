@@ -16,4 +16,5 @@ $ clever addon create postgresql-addon --plan dev pg-todo-drichard
 $ clever service link-addon pg-todo-drichard
 $ clever env set APP_NAME drichard
 $ clever deploy
+$ clever scale --instances 2
 ```
